@@ -35,17 +35,16 @@ import requests
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import CallToolResult
 
-from x402.http import HTTPFacilitatorClientSync
+from x402.http import HTTPFacilitatorClient
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
 from x402.mcp import (
-    MCPToolResult,
+    PaymentWrapperConfig,
     ResourceInfo,
-    SyncPaymentWrapperConfig,
-    create_payment_wrapper_sync,
-    wrap_fastmcp_tool_sync,
+    create_payment_wrapper,
 )
+from x402.mcp.server_async import wrap_fastmcp_tool
 from x402.schemas import ResourceConfig
-from x402.server import x402ResourceServerSync
+from x402.server import x402ResourceServer
 
 CHAIN_ID = 8453  # Base mainnet
 BLOCKSCOUT_URL = "https://api.blockscout.com/v2/api"
@@ -64,13 +63,20 @@ CDP_API_KEY_SECRET = os.environ.get("CDP_API_KEY_SECRET")
 X402_ENABLED = bool(X402_PAY_TO and CDP_API_KEY_ID and CDP_API_KEY_SECRET)
 
 if X402_ENABLED:
-    from cdp.x402 import create_facilitator_config_v2
+    try:
+        from cdp.x402 import create_facilitator_config
 
-    _facilitator_config = create_facilitator_config_v2(CDP_API_KEY_ID, CDP_API_KEY_SECRET)
-    _facilitator_client = HTTPFacilitatorClientSync(_facilitator_config)
-    _resource_server = x402ResourceServerSync(_facilitator_client)
-    _resource_server.register(X402_NETWORK, ExactEvmServerScheme())
-    _resource_server.initialize()
+        _facilitator_config = create_facilitator_config(CDP_API_KEY_ID, CDP_API_KEY_SECRET)
+        _facilitator_client = HTTPFacilitatorClient(_facilitator_config)
+        _resource_server = x402ResourceServer(_facilitator_client)
+        _resource_server.register(X402_NETWORK, ExactEvmServerScheme())
+        _resource_server.initialize()  # network call to the CDP facilitator
+    except Exception as exc:  # noqa: BLE001 - defensive: never let a bad
+        # facilitator config/network hiccup take the whole server down.
+        print(f"[x402] disabled: facilitator setup failed: {exc}")
+        X402_ENABLED = False
+
+if X402_ENABLED:
 
     def _paid_wrapper(tool_name: str, price: str):
         accepts = _resource_server.build_payment_requirements(
@@ -82,9 +88,9 @@ if X402_ENABLED:
                 extra={"name": "USDC", "version": "2"},
             )
         )
-        return create_payment_wrapper_sync(
+        return create_payment_wrapper(
             _resource_server,
-            SyncPaymentWrapperConfig(
+            PaymentWrapperConfig(
                 accepts=accepts,
                 resource=ResourceInfo(url=f"mcp://tool/{tool_name}"),
             ),
@@ -495,33 +501,35 @@ APPROVALS_DOC = (
 )
 
 if X402_ENABLED:
+    from x402.mcp import MCPToolResult
+
     _paid_rugpull = _paid_wrapper("check_rugpull_risk", "$0.01")
     _paid_approvals = _paid_wrapper("check_token_approvals", "$0.02")
 
-    _rugpull_tool = wrap_fastmcp_tool_sync(
-        _paid_rugpull,
-        lambda args, _ctx: MCPToolResult(
+    async def _rugpull_handler(args, _ctx):
+        return MCPToolResult(
             content=[{"type": "text", "text": _check_rugpull_risk_impl(args["address"])}]
-        ),
-        tool_name="check_rugpull_risk",
-    )
-    _approvals_tool = wrap_fastmcp_tool_sync(
-        _paid_approvals,
-        lambda args, _ctx: MCPToolResult(
+        )
+
+    async def _approvals_handler(args, _ctx):
+        return MCPToolResult(
             content=[{"type": "text", "text": _check_token_approvals_impl(args["address"])}]
-        ),
-        tool_name="check_token_approvals",
+        )
+
+    _rugpull_tool = wrap_fastmcp_tool(_paid_rugpull, _rugpull_handler, tool_name="check_rugpull_risk")
+    _approvals_tool = wrap_fastmcp_tool(
+        _paid_approvals, _approvals_handler, tool_name="check_token_approvals"
     )
 
     @mcp.tool()
-    def check_rugpull_risk(address: str, ctx: Context) -> CallToolResult:
+    async def check_rugpull_risk(address: str, ctx: Context) -> CallToolResult:
         f"""{RUGPULL_DOC} Requires payment of $0.01 USDC on Base."""
-        return _rugpull_tool({"address": address}, ctx)
+        return await _rugpull_tool({"address": address}, ctx)
 
     @mcp.tool()
-    def check_token_approvals(address: str, ctx: Context) -> CallToolResult:
+    async def check_token_approvals(address: str, ctx: Context) -> CallToolResult:
         f"""{APPROVALS_DOC} Requires payment of $0.02 USDC on Base."""
-        return _approvals_tool({"address": address}, ctx)
+        return await _approvals_tool({"address": address}, ctx)
 
 else:
     @mcp.tool()
