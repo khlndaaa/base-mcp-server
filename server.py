@@ -32,17 +32,11 @@ import json
 from typing import Optional
 
 import requests
-from mcp.server.fastmcp import Context, FastMCP
-from mcp.types import CallToolResult
+from mcp.server.fastmcp import FastMCP
 
 from x402.http import HTTPFacilitatorClient
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
-from x402.mcp import (
-    PaymentWrapperConfig,
-    ResourceInfo,
-    create_payment_wrapper,
-)
-from x402.mcp.server_async import wrap_fastmcp_tool
+from x402.mcp import ResourceInfo, create_payment_wrapper
 from x402.schemas import ResourceConfig
 from x402.server import x402ResourceServer
 
@@ -90,10 +84,8 @@ if X402_ENABLED:
         )
         return create_payment_wrapper(
             _resource_server,
-            PaymentWrapperConfig(
-                accepts=accepts,
-                resource=ResourceInfo(url=f"mcp://tool/{tool_name}"),
-            ),
+            accepts=accepts,
+            resource=ResourceInfo(url=f"mcp://tool/{tool_name}"),
         )
 
 UNLIMITED_THRESHOLD = 2**255
@@ -501,35 +493,20 @@ APPROVALS_DOC = (
 )
 
 if X402_ENABLED:
-    from x402.mcp import MCPToolResult
-
     _paid_rugpull = _paid_wrapper("check_rugpull_risk", "$0.01")
     _paid_approvals = _paid_wrapper("check_token_approvals", "$0.02")
 
-    async def _rugpull_handler(args, _ctx):
-        return MCPToolResult(
-            content=[{"type": "text", "text": _check_rugpull_risk_impl(args["address"])}]
-        )
-
-    async def _approvals_handler(args, _ctx):
-        return MCPToolResult(
-            content=[{"type": "text", "text": _check_token_approvals_impl(args["address"])}]
-        )
-
-    _rugpull_tool = wrap_fastmcp_tool(_paid_rugpull, _rugpull_handler, tool_name="check_rugpull_risk")
-    _approvals_tool = wrap_fastmcp_tool(
-        _paid_approvals, _approvals_handler, tool_name="check_token_approvals"
-    )
-
     @mcp.tool()
-    async def check_rugpull_risk(address: str, ctx: Context) -> CallToolResult:
+    @_paid_rugpull
+    async def check_rugpull_risk(address: str) -> str:
         f"""{RUGPULL_DOC} Requires payment of $0.01 USDC on Base."""
-        return await _rugpull_tool({"address": address}, ctx)
+        return _check_rugpull_risk_impl(address)
 
     @mcp.tool()
-    async def check_token_approvals(address: str, ctx: Context) -> CallToolResult:
+    @_paid_approvals
+    async def check_token_approvals(address: str) -> str:
         f"""{APPROVALS_DOC} Requires payment of $0.02 USDC on Base."""
-        return await _approvals_tool({"address": address}, ctx)
+        return _check_token_approvals_impl(address)
 
 else:
     @mcp.tool()
