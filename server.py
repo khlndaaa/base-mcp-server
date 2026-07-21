@@ -36,8 +36,8 @@ from mcp.server.fastmcp import FastMCP
 
 from x402.http import HTTPFacilitatorClient
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
-from x402.mcp import ResourceInfo, create_payment_wrapper
-from x402.schemas import ResourceConfig
+from x402.mcp import create_payment_wrapper
+from x402.schemas import ResourceConfig, ResourceInfo
 from x402.server import x402ResourceServer
 
 CHAIN_ID = 8453  # Base mainnet
