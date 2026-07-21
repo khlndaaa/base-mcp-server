@@ -32,13 +32,63 @@ import json
 from typing import Optional
 
 import requests
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import CallToolResult
+
+from x402.http import HTTPFacilitatorClientSync
+from x402.mechanisms.evm.exact import ExactEvmServerScheme
+from x402.mcp import (
+    MCPToolResult,
+    ResourceInfo,
+    SyncPaymentWrapperConfig,
+    create_payment_wrapper_sync,
+    wrap_fastmcp_tool_sync,
+)
+from x402.schemas import ResourceConfig
+from x402.server import x402ResourceServerSync
 
 CHAIN_ID = 8453  # Base mainnet
 BLOCKSCOUT_URL = "https://api.blockscout.com/v2/api"
 BASE_RPC_URL = "https://mainnet.base.org"
 
 API_KEY = os.environ.get("BLOCKSCOUT_API_KEY")
+
+# --- x402 payment config ---------------------------------------------------
+# The two most expensive/valuable tools (rug-pull risk and approval scanning
+# both do heavy multi-request scanning) are gated behind a small USDC
+# micropayment. The four simple lookup tools stay free.
+X402_PAY_TO = os.environ.get("X402_PAY_TO")  # your Base Account address
+X402_NETWORK = "eip155:8453"  # Base mainnet
+CDP_API_KEY_ID = os.environ.get("CDP_API_KEY_ID")
+CDP_API_KEY_SECRET = os.environ.get("CDP_API_KEY_SECRET")
+X402_ENABLED = bool(X402_PAY_TO and CDP_API_KEY_ID and CDP_API_KEY_SECRET)
+
+if X402_ENABLED:
+    from cdp.x402 import create_facilitator_config_v2
+
+    _facilitator_config = create_facilitator_config_v2(CDP_API_KEY_ID, CDP_API_KEY_SECRET)
+    _facilitator_client = HTTPFacilitatorClientSync(_facilitator_config)
+    _resource_server = x402ResourceServerSync(_facilitator_client)
+    _resource_server.register(X402_NETWORK, ExactEvmServerScheme())
+    _resource_server.initialize()
+
+    def _paid_wrapper(tool_name: str, price: str):
+        accepts = _resource_server.build_payment_requirements(
+            ResourceConfig(
+                scheme="exact",
+                network=X402_NETWORK,
+                pay_to=X402_PAY_TO,
+                price=price,
+                extra={"name": "USDC", "version": "2"},
+            )
+        )
+        return create_payment_wrapper_sync(
+            _resource_server,
+            SyncPaymentWrapperConfig(
+                accepts=accepts,
+                resource=ResourceInfo(url=f"mcp://tool/{tool_name}"),
+            ),
+        )
 
 UNLIMITED_THRESHOLD = 2**255
 APPROVAL_TOPIC = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925"
@@ -64,12 +114,18 @@ SUSPICIOUS_PATTERNS = [
     ("delegatecall", 5, "logic can be delegated to another contract"),
 ]
 
+PORT = int(os.environ.get("PORT", "0")) or None
+
 mcp = FastMCP(
     "base-tools",
     instructions=(
         "Read-only tools for inspecting wallets and contracts on the Base "
-        "blockchain (chainId 8453). Never asks for or uses a private key."
+        "blockchain (chainId 8453). Never asks for or uses a private key. "
+        "check_rugpull_risk and check_token_approvals require a small USDC "
+        "payment on Base via x402; the other four tools are free."
     ),
+    host="0.0.0.0" if PORT else "127.0.0.1",
+    port=PORT or 8000,
 )
 
 
@@ -310,20 +366,7 @@ def check_contract_verification(address: str) -> str:
     )
 
 
-@mcp.tool()
-def check_rugpull_risk(address: str) -> str:
-    """Run a heuristic rug-pull risk screen on a Base contract.
-
-    Checks source verification, common scam-token code patterns
-    (blacklists, arbitrary fee/limit changes, trading kill-switches,
-    uncapped minting, etc.), ownership status, and proxy/upgradeability.
-    Returns a 0-100 risk score. This is a heuristic tool, NOT a
-    security audit — always verify manually before making decisions
-    involving money.
-
-    Args:
-        address: The 0x-prefixed contract address to screen.
-    """
+def _check_rugpull_risk_impl(address: str) -> str:
     data = _api_get({"module": "contract", "action": "getsourcecode", "address": address})
     contract = data[0] if isinstance(data, list) and data else None
 
@@ -387,19 +430,7 @@ def check_rugpull_risk(address: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
-def check_token_approvals(address: str) -> str:
-    """Check a wallet's active ERC-20 and NFT token approvals on Base.
-
-    Scans historical Approval/ApprovalForAll events, then verifies the
-    CURRENT on-chain state of each unique pair found (an old event
-    doesn't mean the approval is still active — it may have been
-    reduced or revoked since). Flags unlimited approvals as high-risk.
-    This tool is READ-ONLY and cannot revoke anything.
-
-    Args:
-        address: The 0x-prefixed wallet address to check.
-    """
+def _check_token_approvals_impl(address: str) -> str:
     approval_logs = _fetch_logs(APPROVAL_TOPIC, address)
     approval_for_all_logs = _fetch_logs(APPROVAL_FOR_ALL_TOPIC, address)
 
@@ -451,8 +482,76 @@ def check_token_approvals(address: str) -> str:
     return "\n".join(lines)
 
 
+RUGPULL_DOC = (
+    "Run a heuristic rug-pull risk screen on a Base contract. Checks source "
+    "verification, common scam-token code patterns, ownership status, and "
+    "proxy/upgradeability. Returns a 0-100 risk score. Heuristic only, NOT a "
+    "security audit."
+)
+APPROVALS_DOC = (
+    "Check a wallet's active ERC-20 and NFT token approvals on Base. Scans "
+    "historical Approval/ApprovalForAll events and verifies current on-chain "
+    "state. READ-ONLY, cannot revoke anything."
+)
+
+if X402_ENABLED:
+    _paid_rugpull = _paid_wrapper("check_rugpull_risk", "$0.01")
+    _paid_approvals = _paid_wrapper("check_token_approvals", "$0.02")
+
+    _rugpull_tool = wrap_fastmcp_tool_sync(
+        _paid_rugpull,
+        lambda args, _ctx: MCPToolResult(
+            content=[{"type": "text", "text": _check_rugpull_risk_impl(args["address"])}]
+        ),
+        tool_name="check_rugpull_risk",
+    )
+    _approvals_tool = wrap_fastmcp_tool_sync(
+        _paid_approvals,
+        lambda args, _ctx: MCPToolResult(
+            content=[{"type": "text", "text": _check_token_approvals_impl(args["address"])}]
+        ),
+        tool_name="check_token_approvals",
+    )
+
+    @mcp.tool()
+    def check_rugpull_risk(address: str, ctx: Context) -> CallToolResult:
+        f"""{RUGPULL_DOC} Requires payment of $0.01 USDC on Base."""
+        return _rugpull_tool({"address": address}, ctx)
+
+    @mcp.tool()
+    def check_token_approvals(address: str, ctx: Context) -> CallToolResult:
+        f"""{APPROVALS_DOC} Requires payment of $0.02 USDC on Base."""
+        return _approvals_tool({"address": address}, ctx)
+
+else:
+    @mcp.tool()
+    def check_rugpull_risk(address: str) -> str:
+        f"""{RUGPULL_DOC}
+
+        Args:
+            address: The 0x-prefixed contract address to screen.
+        """
+        return _check_rugpull_risk_impl(address)
+
+    @mcp.tool()
+    def check_token_approvals(address: str) -> str:
+        f"""{APPROVALS_DOC}
+
+        Args:
+            address: The 0x-prefixed wallet address to check.
+        """
+        return _check_token_approvals_impl(address)
+
+
 def main():
-    mcp.run(transport="stdio")
+    # HTTP/SSE transport is required for x402 (and for public/hosted access
+    # in general) — stdio only works for a locally-running client like
+    # Claude Desktop. Falls back to stdio if PORT isn't set, so local dev
+    # via Claude Desktop config still works unchanged.
+    if os.environ.get("PORT"):
+        mcp.run(transport="sse")
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
