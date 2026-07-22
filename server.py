@@ -101,7 +101,7 @@ if X402_ENABLED:
                 network=X402_NETWORK,
                 pay_to=X402_PAY_TO,
                 price=price,
-                extra={"name": "USDC", "version": "2"},
+                extra={"name": "USD Coin", "version": "2"},
             )
         )
         return create_payment_wrapper(
