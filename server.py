@@ -72,7 +72,29 @@ if X402_ENABLED:
 
 if X402_ENABLED:
 
-    def _paid_wrapper(tool_name: str, price: str):
+    def _paid_wrapper(
+        tool_name: str,
+        price: str,
+        *,
+        description: str,
+        example_output: str,
+    ):
+        from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
+
+        discovery = declare_discovery_extension(
+            input={"address": "0x0000000000000000000000000000000000dEaD"},
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "address": {
+                        "type": "string",
+                        "description": "0x-prefixed address on Base mainnet to screen",
+                    }
+                },
+                "required": ["address"],
+            },
+            output=OutputConfig(example=example_output),
+        )
         accepts = _resource_server.build_payment_requirements(
             ResourceConfig(
                 scheme="exact",
@@ -85,7 +107,11 @@ if X402_ENABLED:
         return create_payment_wrapper(
             _resource_server,
             accepts=accepts,
-            resource=ResourceInfo(url=f"mcp://tool/{tool_name}"),
+            resource=ResourceInfo(
+                url=f"mcp://tool/{tool_name}",
+                description=description,
+            ),
+            extensions=discovery,
         )
 
 UNLIMITED_THRESHOLD = 2**255
@@ -493,8 +519,25 @@ APPROVALS_DOC = (
 )
 
 if X402_ENABLED:
-    _paid_rugpull = _paid_wrapper("check_rugpull_risk", "$0.01")
-    _paid_approvals = _paid_wrapper("check_token_approvals", "$0.02")
+    _paid_rugpull = _paid_wrapper(
+        "check_rugpull_risk",
+        "$0.01",
+        description=(
+            "Heuristic 0-100 rug-pull risk score for a Base contract: source "
+            "verification, ownership, proxy/upgradeability, and known scam-token "
+            "code patterns."
+        ),
+        example_output="Risk score: 15/100 (LOW)\nSource verified: yes\nOwnership renounced: yes\n...",
+    )
+    _paid_approvals = _paid_wrapper(
+        "check_token_approvals",
+        "$0.02",
+        description=(
+            "Scans a Base wallet's active ERC-20/NFT token approvals and flags "
+            "unlimited approvals as high-risk. Read-only."
+        ),
+        example_output="2 active approvals found\n1 UNLIMITED approval flagged as high-risk\n...",
+    )
 
     @mcp.tool()
     @_paid_rugpull
