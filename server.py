@@ -571,15 +571,66 @@ else:
         return _check_token_approvals_impl(address)
 
 
+# ---------------------------------------------------------------------------
+# Plain HTTP mirror of check_rugpull_risk.
+#
+# The MCP tool above is gated via x402's MCP-native payment wrapper, whose
+# resource identifier is "mcp://tool/check_rugpull_risk" — not a real HTTP
+# URL. The public x402 Bazaar catalog (api.cdp.coinbase.com/.../discovery)
+# only appears to index genuine "http"-type resources. This route exposes
+# the exact same check as a normal GET endpoint so it can be discovered and
+# called the same way as any other Bazaar listing, independent of MCP.
+# ---------------------------------------------------------------------------
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import JSONResponse, PlainTextResponse
+
+
+@mcp.custom_route("/api/check-rugpull-risk", methods=["GET"])
+async def http_check_rugpull_risk(request: StarletteRequest):
+    address = request.query_params.get("address")
+    if not address:
+        return JSONResponse({"error": "missing required query param: address"}, status_code=400)
+    return PlainTextResponse(_check_rugpull_risk_impl(address))
+
+
 def main():
     # HTTP/SSE transport is required for x402 (and for public/hosted access
     # in general) — stdio only works for a locally-running client like
     # Claude Desktop. Falls back to stdio if PORT isn't set, so local dev
     # via Claude Desktop config still works unchanged.
-    if os.environ.get("PORT"):
-        mcp.run(transport="sse")
-    else:
+    if not os.environ.get("PORT"):
         mcp.run(transport="stdio")
+        return
+
+    import uvicorn
+
+    app = mcp.sse_app()
+
+    if X402_ENABLED:
+        from x402.http import PaymentOption
+        from x402.http.middleware.fastapi import PaymentMiddlewareASGI
+        from x402.http.types import RouteConfig
+
+        http_routes = {
+            "GET /api/check-rugpull-risk": RouteConfig(
+                accepts=[
+                    PaymentOption(
+                        scheme="exact",
+                        pay_to=X402_PAY_TO,
+                        price="$0.01",
+                        network=X402_NETWORK,
+                        extra={"name": "USD Coin", "version": "2"},
+                    )
+                ],
+                mime_type="text/plain",
+                description=RUGPULL_DOC,
+                service_name="Base Rug-Pull Screener",
+                tags=["base", "security", "rugpull"],
+            ),
+        }
+        app.add_middleware(PaymentMiddlewareASGI, routes=http_routes, server=_resource_server)
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ["PORT"]))
 
 
 if __name__ == "__main__":
